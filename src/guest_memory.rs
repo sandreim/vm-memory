@@ -1256,4 +1256,91 @@ mod tests {
         let r = mem.find_region(addr).unwrap();
         assert_eq!(r.is_hugetlbfs(), None);
     }
+
+    use proptest::prelude::*;
+
+    #[cfg(feature = "backend-mmap")]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_write_slice_prop() {
+        let cfg = ProptestConfig::with_cases(100);
+
+        // Generate random range sizes in pages.
+        let sizes = prop::collection::vec(1..0xF_FFFFusize, 1..=1);
+
+        proptest!(cfg, |(control in 1..0xFFu8, sizes in sizes, start in 0..0xFFFF_FFFFusize, gap in 0..std::u64::MAX)| {
+            let mut base = start;
+
+            let mut ranges: Vec<(GuestAddress, usize)> = sizes
+                .clone()
+                .into_iter()
+                .map(|len| {
+                    // Region lengths are multiple of page size (4k).
+                    // len &= !0xFFF;
+                    let range = (GuestAddress::new(base as u64), len);
+                    base += len;
+                    range
+                })
+                .collect();
+
+            // GuestMemoryMmap::from_ranges() expects a sorted and deduplicated list of ranges as input.
+
+            // Create gaps in the memory by removing ranges.
+            // Map first 6 bits of range index to individual bits in gap and remove
+            // the ones that map to 1.
+            let mut index = 0;
+
+            // Generate invalid write addresses and lengths.
+            let mut invalid_writes = Vec::new();
+            ranges.retain(|range| {
+                index += 1;
+                let retain = sizes.len() < 16 || (gap & 1 << (index & 0x3F) == 0);
+                if !retain {
+                    invalid_writes.push((range.0, range.1));
+                }
+
+                retain
+            });
+
+            let mem = GuestMemoryMmap::from_ranges(&ranges).unwrap();
+
+            // Fill mem regions with `control` value.
+            for region in mem.iter() {
+                let buffer = vec![control; region.size()];
+                region.write_slice(&buffer, MemoryRegionAddress(0))?;
+
+                // Generate invalid access starting from valid region.
+                let buf = vec![control + 1; region.size()*10];
+
+                // Try to write next adjacent regions and expect errors.
+                mem.write_slice(&buf[0..], region.start_addr()).unwrap_err();
+            }
+    
+            // Perform invalid writes across regions.
+            for write in invalid_writes {
+                // The buffer we are going to try write has different contents than `control`.
+                let buf = vec![control + 1; write.1*10];
+
+                // Write entire region.
+                mem.write_slice(&buf[0..write.1], write.0).unwrap_err();
+
+                // Try to write next adjacent regions and expect errors.
+                mem.write_slice(&buf[0..], write.0).unwrap_err();
+
+                // Try write starting from previous adjacent region 
+                mem.write_slice(&buf[0..], write.0.checked_sub(0x1).unwrap_or(GuestAddress(0)))
+                    .unwrap_err();
+            }
+
+            // Check that the memory was not touched.
+            for range in ranges {
+                for c in 0..range.1 {
+                    let byte: u8 = mem
+                        .read_obj(range.0.checked_add(c as u64).unwrap())
+                        .unwrap();
+                    prop_assert_eq!(control, byte);
+                }
+            }
+        });
+    }
 }
